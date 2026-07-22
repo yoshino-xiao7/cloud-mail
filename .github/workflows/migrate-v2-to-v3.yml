@@ -1,0 +1,149 @@
+name: One-time D1 migration from v2 to v3
+
+on:
+  workflow_dispatch:
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || vars.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+      D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID || vars.D1_DATABASE_ID }}
+      KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID || vars.KV_NAMESPACE_ID }}
+
+    steps:
+      - name: Validate configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID D1_DATABASE_ID KV_NAMESPACE_ID; do
+            if [ -z "${!name:-}" ]; then
+              echo "Missing required value: $name"
+              exit 1
+            fi
+          done
+
+      - name: Upgrade D1 schema and refresh settings cache
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          D1_URL="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database/${D1_DATABASE_ID}/query"
+
+          d1_query() {
+            local sql="$1"
+            local payload response
+            payload=$(jq -nc --arg sql "$sql" '{sql: $sql}')
+            response=$(curl --silent --show-error --fail-with-body \
+              --request POST "$D1_URL" \
+              --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              --header "Content-Type: application/json" \
+              --data "$payload")
+
+            if ! jq -e '.success == true and (.result | all(.success == true))' <<< "$response" >/dev/null; then
+              echo "D1 query failed" >&2
+              jq '{success, errors, messages, result: [.result[]? | {success, error}]}' <<< "$response" >&2
+              return 1
+            fi
+
+            printf '%s' "$response"
+          }
+
+          has_column() {
+            local table="$1"
+            local column="$2"
+            d1_query "SELECT name FROM pragma_table_info('${table}') WHERE name = '${column}';" \
+              | jq -e '.result[0].results | length > 0' >/dev/null
+          }
+
+          add_column() {
+            local table="$1"
+            local column="$2"
+            local definition="$3"
+            if has_column "$table" "$column"; then
+              echo "Column already exists: ${table}.${column}"
+            else
+              d1_query "ALTER TABLE ${table} ADD COLUMN ${column} ${definition};" >/dev/null
+              echo "Added column: ${table}.${column}"
+            fi
+          }
+
+          add_column setting force_path_style "INTEGER NOT NULL DEFAULT 1"
+          add_column setting custom_domain "TEXT NOT NULL DEFAULT ''"
+          add_column setting tg_msg_to "TEXT NOT NULL DEFAULT 'show'"
+          add_column setting tg_msg_from "TEXT NOT NULL DEFAULT 'only-name'"
+          add_column setting tg_msg_text "TEXT NOT NULL DEFAULT 'show'"
+
+          d1_query "CREATE TABLE IF NOT EXISTS oauth (
+            oauth_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            oauth_user_id TEXT,
+            username TEXT,
+            name TEXT,
+            avatar TEXT,
+            active INTEGER,
+            trust_level INTEGER,
+            silenced INTEGER,
+            create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+            platform INTEGER NOT NULL DEFAULT 0,
+            user_id INTEGER NOT NULL DEFAULT 0
+          );" >/dev/null
+          echo "Ensured table exists: oauth"
+
+          add_column setting min_email_prefix "INTEGER NOT NULL DEFAULT 1"
+          add_column setting email_prefix_filter "TEXT NOT NULL DEFAULT ''"
+
+          if has_column email unread; then
+            echo "Column already exists: email.unread"
+          else
+            d1_query "ALTER TABLE email ADD COLUMN unread INTEGER NOT NULL DEFAULT 0;" >/dev/null
+            d1_query "UPDATE email SET unread = 1;" >/dev/null
+            echo "Added column and initialized existing rows: email.unread"
+          fi
+
+          add_column account all_receive "INTEGER NOT NULL DEFAULT 0"
+
+          if has_column setting auto_refresh; then
+            echo "Column already exists: setting.auto_refresh"
+          elif has_column setting auto_refresh_time; then
+            d1_query "ALTER TABLE setting RENAME COLUMN auto_refresh_time TO auto_refresh;" >/dev/null
+            echo "Renamed setting.auto_refresh_time to setting.auto_refresh"
+          else
+            echo "Neither setting.auto_refresh nor setting.auto_refresh_time exists" >&2
+            exit 1
+          fi
+
+          add_column account sort "INTEGER NOT NULL DEFAULT 0"
+          d1_query "UPDATE setting SET auto_refresh = 5 WHERE auto_refresh = 1;" >/dev/null
+
+          add_column email code "TEXT NOT NULL DEFAULT ''"
+          add_column setting ai_code "INTEGER NOT NULL DEFAULT 1"
+          add_column setting ai_code_filter "TEXT NOT NULL DEFAULT ''"
+          add_column setting black_subject "TEXT NOT NULL DEFAULT ''"
+          add_column setting black_content "TEXT NOT NULL DEFAULT ''"
+          add_column setting black_from "TEXT NOT NULL DEFAULT ''"
+
+          setting_response=$(d1_query "SELECT * FROM setting LIMIT 1;")
+          setting_json=$(jq -c '
+            def camel:
+              split("_") as $parts
+              | $parts[0] + ($parts[1:] | map((.[0:1] | ascii_upcase) + .[1:]) | join(""));
+            .result[0].results[0]
+            | with_entries(.key |= camel)
+            | .resendTokens = ((.resendTokens | fromjson?) // {})
+          ' <<< "$setting_response")
+
+          kv_response=$(curl --silent --show-error --fail-with-body \
+            --request PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/${KV_NAMESPACE_ID}/values/setting%3A" \
+            --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data-binary "$setting_json")
+
+          if ! jq -e '.success == true' <<< "$kv_response" >/dev/null; then
+            echo "KV settings refresh failed" >&2
+            jq '{success, errors, messages}' <<< "$kv_response" >&2
+            exit 1
+          fi
+
+          echo "D1 migration and KV settings refresh completed"
