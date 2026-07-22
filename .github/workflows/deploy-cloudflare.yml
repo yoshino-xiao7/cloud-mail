@@ -24,6 +24,7 @@ jobs:
       D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID || vars.D1_DATABASE_ID }}
       KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID || vars.KV_NAMESPACE_ID }}
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || vars.R2_BUCKET_NAME }}
+      INIT_URL: ${{ secrets.INIT_URL || vars.INIT_URL }}
       PROJECT_LINK: ${{ secrets.PROJECT_LINK || vars.PROJECT_LINK }}
       AI_MODEL: ${{ secrets.AI_MODEL || vars.AI_MODEL || '@cf/meta/llama-3.1-8b-instruct' }}
       CLOUDFLARE_EMAIL: ${{ secrets.CF_EMAIL || vars.CF_EMAIL || false }}
@@ -245,15 +246,20 @@ jobs:
           echo "🛠️ Starting database initialization..."
           sleep 15
           
-          WORKER_URL="${CUSTOM_DOMAIN:+https://$CUSTOM_DOMAIN}"
-          WORKER_URL="${WORKER_URL:-${{ steps.deploy.outputs.worker_url }}}"
-          
-          if [ -z "$WORKER_URL" ]; then
-            echo "❌ Preview URL not available. Please set CUSTOM_DOMAIN."
+          if [ -n "$INIT_URL" ]; then
+            INIT_ENDPOINT="$INIT_URL"
+          else
+            WORKER_URL="${CUSTOM_DOMAIN:+https://$CUSTOM_DOMAIN}"
+            WORKER_URL="${WORKER_URL:-${{ steps.deploy.outputs.worker_url }}}"
+            INIT_ENDPOINT="${WORKER_URL:+$WORKER_URL/api/init/${JWT_SECRET}}"
+          fi
+
+          if [ -z "$INIT_ENDPOINT" ]; then
+            echo "❌ Initialization URL is unavailable. Set INIT_URL or CUSTOM_DOMAIN."
             exit 1
           fi
           
-          HTTP_CODE=$(curl -sL -w "%{http_code}" -o response.txt "$WORKER_URL/api/init/${JWT_SECRET}")
+          HTTP_CODE=$(curl -sL -w "%{http_code}" -o response.txt "$INIT_ENDPOINT")
           RESPONSE_BODY=$(cat response.txt)
 
           if [ "$RESPONSE_BODY" = "success" ]; then
